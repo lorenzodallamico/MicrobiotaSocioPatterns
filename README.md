@@ -8,7 +8,7 @@ In this repository, we share the material for reproducing the results presented 
 
 
 
-If you use these data please reference the following article.
+If you use these data please reference the following article: [https://www.biorxiv.org/content/10.1101/2024.12.27.628096v1](https://www.biorxiv.org/content/10.1101/2024.12.27.628096v1)
 
 ```@cite
 @article {dallamico2024association,
