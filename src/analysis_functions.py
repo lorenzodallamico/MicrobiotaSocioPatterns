@@ -1,86 +1,111 @@
-import umap
+from skbio.diversity import beta_diversity
 import numpy as np
-from scipy.stats import spearmanr
+import pandas as pd
+from itertools import combinations, permutations
 from copy import copy
 from scipy.stats import mannwhitneyu
-from itertools import combinations
-import pandas as pd
+from skbio.stats.distance import DistanceMatrix, permanova
+import re
 from sklearn.ensemble import RandomForestClassifier
 from sklearn import svm
 
-from src.distances import *
+class Model():
+    def __init__(self, df_net, G, microbiota_all, microbiota, asv_ids, tree, days):
+        self.df_net = df_net
+        self.G = G
+        self.microbiota_all = microbiota_all
+        self.microbiota = microbiota
+        self.asv_ids = asv_ids
+        self.tree = tree
+        self.days = days
+
+def PrepareLevels(data, persistences = [1, 3], ths = [0, 1, 10]):
+
+    Models = dict()
+
+    for persistence in persistences:
+        for th in ths:
+            M = Model(None, None, None, None, None, None, None)
+            M.df_net = data.df_net
+            M.G = data.G
+            M.tree = data.tree
+            M.days = data.days
+
+            microbiota_filtered, asv_ids_filtered = Filter(data, persistence, th)
+            M.microbiota_all = microbiota_filtered
+            M.asv_ids = asv_ids_filtered
+
+            all_days = np.sort(np.unique([x[1] for x in data.microbiota_all.index]))
+            M.microbiota = dict(zip(all_days, [microbiota_filtered.xs(day, level='Day code') for day in all_days]))
+
+            Models[(persistence, th)] = M
+
+            for metric in ['jaccard', 'braycurtis', 'weighted_unifrac', 'unweighted_unifrac']:
+                Update_dfnet(Models[(persistence, th)], metric, column = metric)
+
+    return Models
 
 
-def People_vs_time(df, distance):
-    '''Computes pairwise microbiota distances within individuals (across time)
-    and between individuals.
+def Filter(data, persistence, th):
 
-    Use: sim, nsim = People_vs_time(df, distance)
+    microbiota_filtered = copy(data.microbiota_all)
+    microbiota_filtered = FilterPersistentTaxa(microbiota_filtered, persistence)
+    microbiota_filtered, asv_ids_filtered = FilterPrevalence(microbiota_filtered, data.asv_ids, th)
 
-    Inputs:
-        * df (pandas DataFrame): abundance table with a 'Person ID' column;
-          taxa abundances start from column index 4
-        * distance (str): distance measure to use; one of 'jaccard',
-          'bray-curtis', or 'TaxonomicJaccard'
-
-    Outputs:
-        * sim (list): distances between repeated measurements of the same individual
-        * nsim (list): distances between measurements of different individuals
-    '''
-    sim, nsim = [], []
-    all_id = set(df['Person ID'])
-
-    if distance == 'TaxonomicJaccard':
-        D = getBranches(df.iloc[:, 4:])
-        indices = np.array(list(D.keys()))
-
-    for idx in all_id:
-        bool_idx = df['Person ID'] == idx
-        X = df[bool_idx].iloc[:, 4:].values
-        m, _ = X.shape
-
-        for i in range(m):
-            for j in range(i + 1, m):
-                if distance == 'jaccard':
-                    sim.append(jaccard_similarity(X[i], X[j]))
-                elif distance == 'TaxonomicJaccard':
-                    sim.append(TaxonomicJaccard(D, indices[bool_idx][i], indices[bool_idx][j]))
-                elif distance == 'bray-curtis':
-                    sim.append(bray_curtis(X[i], X[j]))
-
-        Y = df[~bool_idx].iloc[:, 4:].values
-        q, _ = Y.shape
-
-        for i in range(m):
-            for j in range(q):
-                if distance == 'jaccard':
-                    nsim.append(jaccard_similarity(X[i], Y[j]))
-                elif distance == 'TaxonomicJaccard':
-                    nsim.append(TaxonomicJaccard(D, indices[bool_idx][i], indices[~bool_idx][j]))
-                elif distance == 'bray-curtis':
-                    nsim.append(bray_curtis(X[i], Y[j]))
-
-    return sim, nsim
+    return microbiota_filtered, asv_ids_filtered
 
 
-def Update_dfnet(data):
-    '''Updates data.df_net with all node pairs, zero-filling missing edges,
-    and appends pairwise Jaccard and TaxonomicJaccard microbiota similarity columns.
+def FilterPrevalence(microbiota_all, asv_ids, th):
+    '''Drops ASVs (columns) present in at most `th` samples across the whole dataset. Singletons
+    like this are a typical signature of sequencing/PCR noise.
 
-    All individuals present in both the contact network and the microbiota
-    dataset are included. Pairs with no observed contact receive weight = 0.
+    Use: microbiota_all, asv_ids = FilterPrevalence(microbiota_all, asv_ids, th)
 
     Inputs:
-        * data (DATA): data container with attributes df_net, G,
-          and df_microbiota_bool
-
-    Outputs:
-        * (modifies data.df_net in place)
+        * th (int): taxa appearing in `th` samples or fewer, across the whole dataset, are dropped.
     '''
+
+    prevalence = (microbiota_all.values > 0).sum(axis=0)
+    keep = prevalence > th
+
+    microbiota_all = microbiota_all.loc[:, keep]
+    asv_ids = np.asarray(asv_ids)[keep]
+
+    return microbiota_all, asv_ids
+
+def FilterPersistentTaxa(microbiota_all, persistence):
+    '''Zeroes out, for each person individually, any taxon that recurs in fewer than
+    `persistence` of that person's own first-wave samples (a transient detection is more likely
+    noise than a stable member of that person's microbiota). Unlike FilterPrevalence, this is
+    evaluated per person: a taxon can be kept for one person and dropped for another.
+
+    Use: microbiota_all = FilterPersistentTaxa(microbiota_all, persistence)
+    '''
+
+    return microbiota_all * (np.sign(microbiota_all).groupby('Person ID').sum() >= persistence)
+
+
+
+def Update_dfnet(data, dist_type, column=None):
+    '''Rebuilds data.df_net as a complete pid/pid2 table (adding zero-weight edges for pairs that
+    never interacted) and adds a column with, for each pair, their microbiota distance averaged
+    across their first-wave (up to 5) measurements. Can be called repeatedly with different
+    dist_type values to add several distance columns.
+
+    Use: Update_dfnet(data, dist_type, column=None)
+
+    Inputs:
+        * data (LoadData.ReturnValue): loaded data, must have df_net, G, microbiota_all, asv_ids, tree
+        * dist_type (str): skbio beta diversity metric, e.g. 'jaccard', 'braycurtis',
+          'weighted_unifrac', or 'unweighted_unifrac'
+        * column (str, optional): name of the column to store the result in data.df_net; defaults to dist_type
+    '''
+
+    column = column or dist_type
+
+    # create a complete network with w = 0 for the missing edges
     idx1, idx2, weight = [], [], []
     all_nodes = np.unique(data.df_net[['pid', 'pid2']])
-    all_nodes = all_nodes[np.isin(all_nodes, data.df_microbiota_bool.index)]
-
     for pid, pid2 in combinations(all_nodes, 2):
         idx1.append(pid)
         idx2.append(pid2)
@@ -89,76 +114,152 @@ def Update_dfnet(data):
         else:
             weight.append(0)
 
-    df_net = pd.DataFrame(np.array([idx1, idx2, weight]).T, columns=['pid', 'pid2', 'weight'])
+    df_net = pd.DataFrame({'pid': idx1, 'pid2': idx2, 'weight': weight})
 
-    df_net['jaccard'] = df_net.apply(
-        lambda x: jaccard_similarity(
-            data.df_microbiota_bool.loc[x.pid].values,
-            data.df_microbiota_bool.loc[x.pid2]
-        ), axis=1
-    )
+    ids = data.microbiota_all.index.map(lambda t: '_'.join(map(str, t)))
+    counts = data.microbiota_all.values
 
-    D = getBranches(data.df_microbiota_bool)
-    df_net['TaxonomicJaccard'] = df_net.apply(lambda x: TaxonomicJaccard(D, x.pid, x.pid2), axis=1)
+    kwargs = {}
+    if dist_type in ('weighted_unifrac', 'unweighted_unifrac'):
+        kwargs = dict(taxa=data.asv_ids, tree=data.tree)
+
+    elif dist_type == 'braycurtis':
+        counts = counts / counts.sum(axis=1, keepdims=True)
+
+    dm = beta_diversity(metric=dist_type, counts=counts, ids=ids, validate=True, **kwargs)
+
+    df_net[column] = df_net.apply(lambda x: average_distance(dm, x.pid, x.pid2, data.days), axis = 1)
+
+    # preserve similarity columns computed by previous calls with other dist_type values
+    # (excluding `column` itself, so re-running with the same dist_type overwrites instead of duplicating)
+    prev_cols = [c for c in data.df_net.columns if c not in ('pid', 'pid2', 'weight', column)]
+    if prev_cols:
+        df_net = df_net.merge(data.df_net[['pid', 'pid2'] + prev_cols], on = ['pid', 'pid2'], how = 'left')
 
     data.df_net = df_net
-    data.df_net.weight = data.df_net.weight.astype(float)
 
+    return
 
-def df_net_strong_ties(data):
-    '''Generates a null model by randomly shuffling edge weights and computing
-    average microbiota similarity above a series of contact-duration thresholds.
+def average_distance(dm, pid, pid2, days):
+        dists = []
+        for day in days:
+            a, b = f'{pid}_{day}', f'{pid2}_{day}'
+            if a in dm.ids and b in dm.ids:
+                dists.append(dm[a, b])
+        return np.mean(dists)
 
-    Use: Jaccard, UniSim, tv = df_net_strong_ties(data)
+def People_vs_time(data, dist_type):
+    '''Computes, for every pair of samples, the microbiota distance between repeated measurements
+    of the same person (sim) versus between different people (nsim) - the basis for testing
+    whether an individual's microbiota is more stable across time than across people.
+
+    Use: sim, nsim = People_vs_time(data, dist_type)
 
     Inputs:
-        * data (DATA): data container whose df_net has 'weight', 'jaccard',
-          and 'TaxonomicJaccard' columns
+        * data (LoadData.ReturnValue): loaded data, must have microbiota_all, asv_ids, tree
+        * dist_type (str): skbio beta diversity metric, e.g. 'jaccard', 'braycurtis',
+          'weighted_unifrac'.
 
     Outputs:
-        * Jaccard (list of lists): for each randomisation trial, the mean
-          Jaccard similarity above each threshold in tv
-        * UniSim (list of lists): same for TaxonomicJaccard similarity
-        * tv (array): contact-duration thresholds in hours (6 values from 0 to 6)
+        * sim (list): pairwise distances between repeated samples of the same person
+        * nsim (list): pairwise distances between samples of different people
     '''
+
+    sim, nsim = [], []
+    ids = data.microbiota_all.index.map(lambda t: '_'.join(map(str, t)))
+    counts = data.microbiota_all.values
+
+    kwargs = {}
+    if dist_type in ('weighted_unifrac', 'unweighted_unifrac'):
+        kwargs = dict(taxa=data.asv_ids, tree=data.tree)
+    elif dist_type == 'braycurtis':
+        # bray-curtis is sensitive to sequencing depth, so normalize to relative abundances first
+        counts = counts / counts.sum(axis=1, keepdims=True)
+
+    dm = beta_diversity(metric=dist_type, counts=counts, ids=ids, validate=True, **kwargs)
+
+    for a in ids:
+        for b in ids:
+            if a != b:
+                if a.split('_')[0] == b.split('_')[0]:
+                    sim.append(dm[a, b])
+                else:
+                    nsim.append(dm[a, b])
+
+    return sim, nsim
+
+def df_net_strong_ties(data, column, n_sim=1500):
+    '''Null model for the mean microbiota similarity among pairs whose contact duration exceeds
+    increasing thresholds: contact durations are randomly reshuffled across pairs `n_sim` times,
+    breaking any true link between contact duration and similarity, so the resulting distribution
+    shows what the threshold curve would look like by chance alone.
+
+    Use: Sim, tv = df_net_strong_ties(data, column)
+
+    Inputs:
+        * data (LoadData.ReturnValue or Model): must have df_net with a weight column and the
+          requested similarity column
+        * column (str): name of the data.df_net column to use, e.g. 'jaccard', 'braycurtis'
+        * n_sim (int): number of randomizations
+
+    Outputs:
+        * Sim (list): for each randomization, the mean of column at each threshold in tv
+        * tv (array): threshold values (in hours)
+    '''
+
+    # set of thresholds considered (the unit is hours)
     tv = np.linspace(0, 6, 6)
 
+    # randomize and store in X the mean similarity
     df_net_rdn = copy(data.df_net)
     x = copy(df_net_rdn.weight.values)
-    Jaccard, UniSim = [], []
-    n_sim = 1500
+    Sim = []
 
     for i in range(n_sim):
-        print(i, end='\r')
+        print(i, end = '\r')
 
         np.random.shuffle(x)
         df_net_rdn.weight = x
-        Jaccard.append([df_net_rdn[df_net_rdn.weight * 10 / 3600 > t].jaccard.mean() for t in tv])
-        UniSim.append([df_net_rdn[df_net_rdn.weight * 10 / 3600 > t].TaxonomicJaccard.mean() for t in tv])
+        Sim.append([df_net_rdn[df_net_rdn.weight*10/3600 > t][column].mean() for t in tv])
 
-    return Jaccard, UniSim, tv
+    return Sim, tv
+
+
+def GetMicrobiotaBool(data):
+    '''Builds a (person x taxon) boolean presence table: 1 if a person ever presented a taxon
+    across their first-wave (up to 5) measurements, 0 otherwise
+
+    Use: df_microbiota_bool = GetMicrobiotaBool(data)
+
+    Inputs:
+        * data (LoadData.ReturnValue): loaded data, must have microbiota_all, G
+
+    Outputs:
+        * df_microbiota_bool (DataFrame): index = Person ID (as str, to match data.G's node dtype),
+          columns = taxa, values in {0, 1}
+    '''
+
+    return np.sign(data.microbiota_all).groupby('Person ID').sum()
 
 
 def GetTaxaPValues(data):
-    '''For each taxon, tests whether pairs of individuals who both carry it
-    have significantly different contact duration compared with pairs where
-    only one individual carries it (Mann-Whitney U test).
+    '''For each taxon, tests whether pairs who both carry it have significantly different contact
+    durations than pairs where only one of them does (Mann-Whitney U, both tails).
 
     Use: Psmall, Plarge, Ysingle, Yboth, rsmall, rlarge, delta_t = GetTaxaPValues(data)
 
     Inputs:
-        * data (DATA): data container with attributes G, df_net, and df_microbiota_bool
+        * data (LoadData.ReturnValue): loaded data, must have df_net, G, and df_microbiota_bool
+          (set data.df_microbiota_bool = GetMicrobiotaBool(data) beforehand)
 
     Outputs:
-        * Psmall (dict): p-values for the alternative 'less' (both < one)
-        * Plarge (dict): p-values for the alternative 'greater' (both > one)
-        * Ysingle (dict): contact-duration arrays for pairs where only one
-          individual carries the taxon
-        * Yboth (dict): contact-duration arrays for pairs where both
-          individuals carry the taxon
-        * rsmall, rlarge (dict): rank-biserial correlation coefficients
-        * delta_t (dict): median(both) - median(single) for each taxon
+        * Psmall, Plarge (dict): p-values for the 'less'/'greater' alternatives, per taxon
+        * rsmall, rlarge (dict): rank-biserial effect size matching Psmall/Plarge, per taxon
+        * Yboth (dict): contact durations of pairs where both members carry the taxon
+        * Ysingle (dict): contact durations of pairs where exactly one member carries the taxon
+        * delta_t (dict): median(Yboth) - median(Ysingle), per taxon
     '''
+
     all_nodes = np.unique(data.df_net[['pid', 'pid2']])
     idx1, idx2, weights = [], [], []
 
@@ -170,38 +271,37 @@ def GetTaxaPValues(data):
         else:
             weights.append(0)
 
-    df_net = pd.DataFrame(np.array([idx1, idx2, weights]).T, columns=['pid', 'pid2', 'weight'])
-    df_net.weight = df_net.weight.astype(float)
+    df_net = pd.DataFrame({'pid': idx1, 'pid2': idx2, 'weight': weights})
 
     A = data.df_microbiota_bool.loc[df_net.pid].values
     B = data.df_microbiota_bool.loc[df_net.pid2].values
     IDXboth = (A * B) > 0
-    IDXone = (A + B) * (1 - A * B) > 0
+    IDXone = (np.sign(A) + np.sign(B)) * (1 - np.sign(A) * np.sign(B)) > 0
     _, m = IDXboth.shape
 
-    Yboth = [df_net.weight.values[IDXboth[:, i]] for i in range(m)]
-    Ysingle = [df_net.weight.values[IDXone[:, i]] for i in range(m)]
+    Yboth = [df_net.weight.values[IDXboth[:,i]] for i in range(m)]
+    Ysingle = [df_net.weight.values[IDXone[:,i]] for i in range(m)]
 
     index, Psmall, Plarge, rsmall, rlarge = [], [], [], [], []
     Yboth_, Ysingle_ = [], []
     delta_t = []
     taxa = list(data.df_microbiota_bool.columns)
 
-    for i in range(m):
+    for i in range(m):   
         if len(Yboth[i]) * len(Ysingle[i]) > 0:
-            Usmall, psmall = mannwhitneyu(Yboth[i], Ysingle[i], alternative='less')
-            Ularge, plarge = mannwhitneyu(Yboth[i], Ysingle[i], alternative='greater')
+            Usmall, psmall = mannwhitneyu(Yboth[i], Ysingle[i], alternative = 'less')
+            Ularge, plarge = mannwhitneyu(Yboth[i], Ysingle[i], alternative = 'greater')
 
             delta_t.append(np.median(Yboth[i]) - np.median(Ysingle[i]))
-            rsmall.append(1 - 2 * Usmall / (len(Yboth[i]) * len(Ysingle[i])))
-            rlarge.append(1 - 2 * Ularge / (len(Yboth[i]) * len(Ysingle[i])))
+            rsmall.append(1 - 2*Usmall/(len(Yboth[i])*len(Ysingle[i])))
+            rlarge.append(1 - 2*Ularge/(len(Yboth[i])*len(Ysingle[i])))
 
             index.append(taxa[i])
             Psmall.append(psmall)
             Plarge.append(plarge)
             Yboth_.append(Yboth[i])
             Ysingle_.append(Ysingle[i])
-
+                
     Psmall = np.array(Psmall)
     Plarge = np.array(Plarge)
 
@@ -209,37 +309,27 @@ def GetTaxaPValues(data):
     Ysingle, Yboth = dict(zip(index, Ysingle_)), dict(zip(index, Yboth_))
     delta_t = dict(zip(index, delta_t))
     rsmall, rlarge = dict(zip(index, rsmall)), dict(zip(index, rlarge))
-
+    
     return Psmall, Plarge, Ysingle, Yboth, rsmall, rlarge, delta_t
 
 
-def FindSignificantTaxa(P, R, Delta, eps):
-    '''Returns a DataFrame of taxa that survive Bonferroni correction at level eps.
+def FindSignificantTaxa(P, R, Delta, eps = 0.05):
+    '''Returns a DataFrame of the taxa whose p-value in P survives Bonferroni correction at level eps'''
 
-    Inputs:
-        * P (dict): raw p-values keyed by full taxonomy string
-        * R (dict): rank-biserial correlation coefficients keyed by taxonomy string
-        * Delta (dict): median contact-duration differences keyed by taxonomy string
-        * eps (float): significance threshold after Bonferroni correction
-
-    Outputs:
-        * significant (DataFrame): columns taxon, taxon_full, p_value,
-          correlation, delta_t; sorted by corrected p-value
-    '''
     n_taxa = len(P.keys())
     print(f'The test was run on {n_taxa} taxa')
 
     taxa = np.array(list(P.keys()))
-    p = np.array([P[x] * n_taxa for x in taxa if P[x] * n_taxa < eps])
-    r = np.array([R[x] for x in taxa if P[x] * n_taxa < eps])
-    delta = np.array([Delta[x] for x in taxa if P[x] * n_taxa < eps])
-
-    taxa_full = np.array([x for x in P if P[x] * n_taxa < eps])
-    taxa = np.array([getName(x) for x in taxa_full])
-
+    p = np.array([P[x]*n_taxa for x in taxa if P[x]*n_taxa < eps])
+    r = np.array([R[x] for x in taxa if P[x]*n_taxa < eps])
+    delta = np.array([Delta[x] for x in taxa if P[x]*n_taxa < eps])
+    
+    taxa_full = np.array([x for x in P if P[x]*n_taxa < eps])
+    taxa =  np.array([getName(x) for x in taxa_full])
+    
     idx = np.argsort(p)
     p, taxa, taxa_full, r, delta = p[idx], taxa[idx], taxa_full[idx], r[idx], delta[idx]
-    significant = pd.DataFrame(columns=['taxon', 'taxon_full', 'p_value', 'correlation', 'delta_t'])
+    significant = pd.DataFrame(columns = ['taxon', 'taxon_full', 'p_value', 'correlation', 'delta_t'])
     significant.taxon = taxa
     significant.taxon_full = taxa_full
     significant.p_value = p
@@ -250,18 +340,14 @@ def FindSignificantTaxa(P, R, Delta, eps):
 
 
 def getName(name):
-    '''Extracts the most specific informative taxonomic label from a
-    semicolon-delimited taxonomy string.
-
-    Uninformative labels (e.g. uncultured_bacterium, metagenome) are stripped
-    before traversing from the finest to the coarsest taxonomic level.
-
-    Inputs:
-        * name (str): semicolon-delimited taxonomy string
-
-    Returns:
-        * str: the deepest non-ambiguous taxonomic label, or 'unknown'
+    '''Returns the last available taxonomic level of a semicolon-separated lineage string
+    (e.g. "d__Bacteria;...;g__Streptococcus;s__.11"). Each level is stripped only of its
+    trailing per-ASV disambiguator (e.g. ".11", ".1") before being checked for content, so a
+    genuine species-level epithet (e.g. "Corynebacterium_durum.10" -> "Corynebacterium_durum")
+    is kept, and only a level that is truly blank or a known placeholder after that falls back
+    to the next shallower level.
     '''
+
     name = name.replace('uncultured_bacterium', '')
     name = name.replace('metagenome', '')
     name = name.replace('Unassigned', '')
@@ -269,7 +355,8 @@ def getName(name):
     name = name.replace('uncultured_organism', '')
 
     name_ = name.split(';')
-    i = len(name_) - 1
+    i = len(name_)-1
+
     flag = 0
 
     while flag == 0:
@@ -277,81 +364,47 @@ def getName(name):
             name = 'unknown'
             flag = 1
         else:
-            if len(name_[i].split('__')) == 1:
-                i = i - 1
+            level = name_[i]
+            if len(level.split('__')) == 1:
+                i = i-1
             else:
-                if len(name_[i].split('.')) > 1:
-                    i = i - 1
+                rank, _, value = level.partition('__')
+                value = re.sub(r'\.\d+$', '', value)
+                if value == '':
+                    i = i-1
                 else:
                     flag = 1
-                    name = name_[i]
+                    name = f'{rank}__{value}'
     return name
 
 
-def GetSim(df_net, g, measure):
-    '''Bins contact weights logarithmically and returns the mean weight and
-    mean microbiota similarity per bin.
+def getNameByHand(name, level):
+    '''Shortens a lineage string to its epithet at the given rank, e.g.
+    getNameByHand('...;g__Streptococcus;...', 'g') -> 'g_Streptococcus' '''
 
-    Use: weight_bins, sim_bins = GetSim(df_net, g, measure)
+    epithet = name.split(f'{level}__')[1].split(';')[0].split('_')[0]
 
-    Inputs:
-        * df_net (pandas DataFrame): contact network with 'weight', 'jaccard',
-          and 'TaxonomicJaccard' columns
-        * g (int): bin frequency; controls the number of bins (between 1 and 100;
-          larger values yield fewer bins)
-        * measure (str): microbiota similarity column to aggregate;
-          one of 'jaccard' or 'TaxonomicJaccard'
-
-    Outputs:
-        * weight_bins (list): mean log(weight + 1) per bin
-        * sim_bins (list): mean microbiota similarity per bin
-    '''
-    perc = [np.percentile(np.log(df_net.weight + 1), x) for x in range(1, 100) if x % g == 0]
-    df_net['log_w'] = np.sum([np.log(df_net.weight) >= p for p in perc], axis=0)
-    all_weights = set(df_net.log_w)
-    x, y = [], []
-
-    for w in all_weights:
-        idx = df_net.log_w == w
-        x.append(np.log(df_net[idx].weight + 1).mean())
-        y.append(df_net[idx][measure].mean())
-
-    return x, y
+    return f'{level}_{epithet}'
 
 
 def LinearFit(x, y):
-    '''Returns the slope and intercept of an ordinary least-squares linear fit.
+    '''Ordinary least-squares fit of y = alpha * x + c'''
 
-    Inputs:
-        * x, y (array-like): input variables
-
-    Outputs:
-        * alpha (float): slope
-        * c (float): intercept
-    '''
     x, y = np.array(x), np.array(y)
-    alpha = (np.mean(x * y) - np.mean(x) * np.mean(y)) / np.var(x)
-    c = np.mean(y) - alpha * np.mean(x)
+    alpha = (np.mean(x*y) - np.mean(x)*np.mean(y)) / np.var(x)
+    c = np.mean(y) - alpha*np.mean(x)
+
     return alpha, c
 
 
 def ComputeROC(sim_train, sim_test, y_train, y_test, classifier):
-    '''Trains a classifier and returns TPR and FPR on the test set.
+    '''Fits `classifier` on (sim_train, y_train) and returns its TPR, FPR on the test set'''
 
-    Inputs:
-        * sim_train, sim_test (array): feature matrices
-        * y_train, y_test (array): binary labels (1 = contact above threshold)
-        * classifier (str): 'svm' (RBF kernel) or 'random_forest'
-
-    Outputs:
-        * TPR (float): true positive rate
-        * FPR (float): false positive rate
-    '''
     if classifier == 'svm':
-        res = svm.SVC(kernel='rbf').fit(sim_train, y_train)
+        res = svm.SVC(kernel = 'rbf').fit(sim_train, y_train)    
     if classifier == 'random_forest':
         res = RandomForestClassifier(max_depth=2, random_state=0).fit(sim_train, y_train)
-
+    
     pred = res.predict(sim_test)
 
     P, N = np.sum(y_test == 1), np.sum(y_test == 0)
@@ -360,80 +413,57 @@ def ComputeROC(sim_train, sim_test, y_train, y_test, classifier):
     elif N == 0:
         TPR, FPR = 1, 1
     else:
-        TPR = np.sum((y_test == 1) & (pred == 1)) / P
-        FPR = np.sum((y_test == 0) & (pred == 1)) / N
+        TPR = np.sum((y_test == 1) & (pred == 1))/P
+        FPR = np.sum((y_test == 0) & (pred == 1))/N
 
     return TPR, FPR
 
 
-def GetUmapEmbedding(D, n, nn):
-    '''Computes a 2D UMAP embedding from a precomputed distance matrix and
-    evaluates its quality via Spearman correlation with the original distances.
+def BuildDistanceMatrix(data, dist):
 
-    Inputs:
-        * D (array): n×n precomputed distance matrix
-        * n (int): number of samples
-        * nn (int): number of nearest neighbours for UMAP
+    ids = data.microbiota_all.index.map(lambda t: '_'.join(map(str, t)))
+    counts = data.microbiota_all.values
 
-    Outputs:
-        * X (array): n×2 UMAP embedding coordinates
-        * r (float): Spearman correlation between embedded and original distances
-        * p (float): p-value of the Spearman correlation
+    kwargs = {}
+    if dist in ('weighted_unifrac', 'unweighted_unifrac'):
+        kwargs = dict(taxa=data.asv_ids, tree=data.tree)
+    elif dist == 'braycurtis':
+        # bray-curtis is sensitive to sequencing depth, so normalize to relative abundances first
+        counts = counts / counts.sum(axis=1, keepdims=True)
+
+    dm = beta_diversity(metric=dist, counts=counts, ids=ids, validate=True, **kwargs)
+
+    return dm.data
+
+
+def RunPermanova(data, dist):
+    '''Runs PERMANOVA on the microbiota distance matrix twice: grouping samples by sampling day,
+    and grouping samples by person. A low R2/p-value for "day" and a high one for "person" would
+    indicate that microbiota composition is driven more by individual identity than by when the
+    sample was taken.
+
+    Use: R2_day, p_day, R2_person, p_person = RunPermanova(data, dist)
     '''
-    X = umap.UMAP(metric='precomputed', n_neighbors=nn).fit_transform(D)
 
-    Dumap = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            Dumap[i, j] = np.linalg.norm(X[i] - X[j])
+    ids = data.microbiota_all.index.map(lambda t: '_'.join(map(str, t)))
+    D = BuildDistanceMatrix(data, dist)
 
-    res = spearmanr(Dumap.flatten(), D.flatten())
-    return X, res.statistic, res.pvalue
+    day_codes = data.microbiota_all.index.get_level_values('Day code')
+    person_id_grouping = data.microbiota_all.index.get_level_values('Person ID')
+
+    D_arr = np.asarray(D)
+    perm_dm = DistanceMatrix(D_arr, ids=list(ids))
+    res1 = permanova(perm_dm, grouping=day_codes)
+    res2 = permanova(perm_dm, grouping=person_id_grouping)
+
+    return ComputeR2Permanova(res1, D, day_codes), res1['p-value'], ComputeR2Permanova(res2, D, person_id_grouping), res2['p-value']
 
 
-def ComputeR2Permanova(res, D, data):
-    '''Computes the R² effect size for a PERMANOVA result.
+def ComputeR2Permanova(res, D, grouping):
+    '''Converts a PERMANOVA pseudo-F statistic into an R2 effect size'''
 
-    R² is derived from the pseudo-F statistic as the fraction of total
-    variance explained by the grouping factor.
-
-    Inputs:
-        * res: PERMANOVA result object (from skbio.stats.distance.permanova)
-        * D (array): distance matrix used in the test
-        * data (DATA): data container with df_microbiota (used to count groups)
-
-    Outputs:
-        * float: R² in [0, 1]
-    '''
     F = res['test statistic']
     n, _ = D.shape
-    g = len(data.df_microbiota['Person ID'].unique())
-    return (1 + (n - g) / ((g - 1) * F)) ** (-1)
+    g = len(np.unique(grouping))
 
-
-def getNameByHand(name, level):
-    '''Extracts the taxonomic label at a specified rank from a
-    semicolon-delimited taxonomy string.
-
-    Inputs:
-        * name (str): semicolon-delimited taxonomy string
-        * level (str): taxonomic rank prefix; one of 'd' (domain), 'p' (phylum),
-          'c' (class), 'g' (genus), 's' (species)
-
-    Returns:
-        * str: the label at the requested rank, stripped of trailing suffixes
-    '''
-    names = name.split(';')
-    flag = 0
-    i = len(names) - 1
-
-    while flag == 0:
-        x = names[i]
-        x_split = x.split('__')
-        if x_split[0] == level:
-            flag = 1
-            name_ = x
-        else:
-            i = i - 1
-
-    return name_.split('.')[0]
+    return (1 + (n-g)/((g-1)*F))**(-1)

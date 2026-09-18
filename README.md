@@ -1,40 +1,41 @@
-# Microbiota and Social Contacts
+# Social contacts and microbiome sharing (Molde, Norway)
 
-This repository contains the code to reproduce the analyses presented in the paper
-*Association Between Oral Microbiota and Close-Range Proximity in a Primary School*.
+Codes to reproduce the results of *Association Between Oral Microbiota and Close-Range Proximity in a Primary School*.
 
-The study investigates whether face-to-face contact patterns — measured via
-wearable proximity sensors in a Norwegian school cohort — are associated with
-the composition of participants' gut microbiota.
+The study investigates whether face-to-face contact patterns — measured via wearable proximity sensors in a Norwegian school cohort — are associated with the composition of participants' oral microbiota.
+
+> **NOTE**: these codes should be run in `Python 3.9`
 
 ---
 
 ## Repository structure
 
 ```
-
-Analysis.ipynb          # Main analysis notebook
+Analysis.ipynb          # Main notebook: loads the data, runs every analysis, and renders the figures inline
 Data/
-├── ContactNetwork.csv      # Weighted contact network (edge list)
-├── microbiota_bool.csv     # Binary taxon presence/absence per individual
-└── microbiota.csv          # Raw taxon abundance table (multiple time points)
+├── ASV_cleaned.csv          # Microbiota abundance table (multiple time points)
+├── table__tax_by_ASV.xlsx   # ASV taxonomy
+├── df_net.csv               # Weighted contact network (edge list)
+└── molde__nwk_trees.tar-1/  # Rooted phylogenetic tree, used for UniFrac
 src/
-├── distances.py            # Microbiota distance/similarity functions
-└── analysis_functions.py   # Higher-level analysis functions
+├── LoadData.py              # Load(): assembles the contact network, taxonomy, tree and microbiota table
+└── analysis_functions.py    # Filtering, distance, statistical test and plotting-support functions
 ```
 
 ## Data
 
 | File | Description |
 |------|-------------|
-| `ContactNetwork.csv` | Edge list with columns `pid`, `pid2`, `weight` (cumulative contact duration in units of 10 s) |
-| `microbiota_bool.csv` | Binary presence/absence table; rows = individuals, columns = semicolon-delimited ASV taxonomy strings |
-| `microbiota.csv` | Full abundance table; first four columns are metadata (`Person ID`, `Sampling-date`, `Day code`, one more); remaining columns are ASV abundances |
+| `ASV_cleaned.csv` | Abundance table; rows indexed by (pseudo-anonymized) `Person ID` and `Day code`, remaining columns are ASV abundances |
+| `table__tax_by_ASV.xlsx` | ASV taxonomy table |
+| `df_net.csv` | Edge list with columns `pid`, `pid2`, `weight` (cumulative contact duration), merged across the two deployments |
+| `molde__nwk_trees.tar-1/` | Rooted phylogenetic tree (`6-rooted-tree.nwk`) |
 
+Participant IDs (`Person ID` in `ASV_cleaned.csv`, `pid`/`pid2` in `df_net.csv`) are pseudo-anonymized hexadecimal strings (e.g. `0x168e`) and must match between the two files for the same person.
 
 ## Citation
 
-````
+```
 @article {dallamico2024association,
 	author = {Dall'Amico, Lorenzo and Bai, Xiangning and Weltzien, Sandra Marie and Rayner, Simon and Paolotti, Daniela and Budin Ljosne, Isabelle Sylvie and Matussek, Andreas and Furberg, Anne-Sofie and Cattuto, Ciro and Sivert Nielsen, Christopher},
 	title = {Association Between Oral Microbiota and Close-Range Proximity in a Primary School},
@@ -42,4 +43,4 @@ src/
 	doi = {10.1101/2024.12.27.628096},
 	journal = {bioRxiv}
 }
-````
+```
